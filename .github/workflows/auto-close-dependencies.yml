@@ -1,3 +1,210 @@
+# file: tools/github_nuke.py
+# Python 3.9+
+"""
+Minimal destructive GitHub repo nuke script.
+Usage:
+  export GITHUB_TOKEN="ghp_xxx"
+  python3 github_nuke.py owner repo
+
+This script:
+ - deletes webhooks
+ - deletes deploy keys
+ - deletes Actions secrets
+ - deletes Dependabot secrets (if present)
+ - removes branch protection rules
+ - removes collaborators
+ - disables topics/features
+ - deletes the repository
+"""
+# Why: This script centralises repository teardown via the GitHub REST API.
+
+import sys
+import os
+import requests
+from typing import List, Dict, Any
+
+GITHUB_API = "https://api.github.com"
+
+def api_headers(token: str) -> Dict[str,str]:
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "github-nuke-script",
+    }
+
+def handle_resp(r: requests.Response, context: str = "") -> None:
+    if r.status_code >= 400:
+        print(f"[WARN] {context} -> HTTP {r.status_code}: {r.text}")
+    else:
+        print(f"[OK] {context} -> {r.status_code}")
+
+def list_and_delete_hooks(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/hooks"
+    r = requests.get(url, headers=api_headers(token))
+    handle_resp(r, "list hooks")
+    for h in r.json() or []:
+        hid = h.get("id")
+        if hid:
+            dr = requests.delete(f"{url}/{hid}", headers=api_headers(token))
+            handle_resp(dr, f"delete hook {hid}")
+
+def list_and_delete_deploy_keys(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/keys"
+    r = requests.get(url, headers=api_headers(token))
+    handle_resp(r, "list deploy keys")
+    for k in r.json() or []:
+        kid = k.get("id")
+        if kid:
+            dr = requests.delete(f"{url}/{kid}", headers=api_headers(token))
+            handle_resp(dr, f"delete deploy key {kid}")
+
+def list_and_delete_actions_secrets(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/actions/secrets"
+    r = requests.get(url, headers=api_headers(token))
+    handle_resp(r, "list actions secrets")
+    for s in (r.json().get("secrets") if r.ok else []) or []:
+        name = s.get("name")
+        if name:
+            dr = requests.delete(f"{url}/{name}", headers=api_headers(token))
+            handle_resp(dr, f"delete actions secret {name}")
+
+def list_and_delete_dependabot_secrets(owner: str, repo: str, token: str):
+    # Dependabot secrets use a different endpoint for repo-level secrets
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/dependabot/secrets"
+    r = requests.get(url, headers=api_headers(token))
+    if r.status_code == 404:
+        print("[OK] dependabot secrets endpoint not present or not enabled")
+        return
+    handle_resp(r, "list dependabot secrets")
+    for s in (r.json().get("secrets") if r.ok else []) or []:
+        name = s.get("name")
+        if name:
+            dr = requests.delete(f"{url}/{name}", headers=api_headers(token))
+            handle_resp(dr, f"delete dependabot secret {name}")
+
+def list_and_remove_collaborators(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/collaborators"
+    r = requests.get(url, headers=api_headers(token))
+    handle_resp(r, "list collaborators")
+    for c in r.json() or []:
+        user = c.get("login")
+        if user:
+            dr = requests.delete(f"{url}/{user}", headers=api_headers(token))
+            handle_resp(dr, f"remove collaborator {user}")
+
+def list_and_remove_teams(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/teams"
+    r = requests.get(url, headers=api_headers(token))
+    handle_resp(r, "list teams with access")
+    for t in r.json() or []:
+        slug = t.get("slug")
+        if slug:
+            dr = requests.delete(f"{url}/{slug}", headers=api_headers(token))
+            handle_resp(dr, f"remove team {slug}")
+
+def remove_branch_protections(owner: str, repo: str, token: str):
+    branches_url = f"{GITHUB_API}/repos/{owner}/{repo}/branches"
+    r = requests.get(branches_url, headers=api_headers(token))
+    handle_resp(r, "list branches")
+    for br in r.json() or []:
+        name = br.get("name")
+        if not name:
+            continue
+        prot_url = f"{GITHUB_API}/repos/{owner}/{repo}/branches/{name}/protection"
+        # Try to delete protection (may 404)
+        dr = requests.delete(prot_url, headers=api_headers(token))
+        handle_resp(dr, f"delete branch protection for {name}")
+
+def disable_features_and_clear_topics(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}"
+    body = {
+        "has_projects": False,
+        "has_wiki": False,
+        "has_pages": False,
+        "allow_merge_commit": False,
+        "allow_squash_merge": False,
+        "allow_rebase_merge": False,
+        # remove topics by sending empty list
+        "topics": []
+    }
+    r = requests.patch(url, headers={**api_headers(token), "Accept": "application/vnd.github.mercy-preview+json"}, json=body)
+    handle_resp(r, "disable features and clear topics")
+
+def delete_repo(owner: str, repo: str, token: str):
+    url = f"{GITHUB_API}/repos/{owner}/{repo}"
+    r = requests.delete(url, headers=api_headers(token))
+    handle_resp(r, "delete repository")
+    if r.status_code == 204:
+        print("[CRITICAL] Repository deleted successfully.")
+    else:
+        print("[CRITICAL] Repository deletion may have failed or requires extra privileges.")
+
+def main(argv: List[str]):
+    if len(argv) < 3:
+        print("Usage: python3 github_nuke.py OWNER REPO")
+        sys.exit(1)
+
+    owner = argv[1]
+    repo = argv[2]
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        print("Set GITHUB_TOKEN in environment with sufficient scopes (repo, delete_repo).")
+        sys.exit(1)
+
+    print(f"[INFO] Starting destructive cleanup for {owner}/{repo}.")
+    # best-effort sequence; continue on errors but warn
+    try:
+        list_and_delete_hooks(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_delete_hooks: {e}")
+
+    try:
+        list_and_delete_deploy_keys(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_delete_deploy_keys: {e}")
+
+    try:
+        list_and_delete_actions_secrets(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_delete_actions_secrets: {e}")
+
+    try:
+        list_and_delete_dependabot_secrets(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_delete_dependabot_secrets: {e}")
+
+    try:
+        remove_branch_protections(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] remove_branch_protections: {e}")
+
+    try:
+        list_and_remove_collaborators(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_remove_collaborators: {e}")
+
+    try:
+        list_and_remove_teams(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] list_and_remove_teams: {e}")
+
+    try:
+        disable_features_and_clear_topics(owner, repo, token)
+    except Exception as e:
+        print(f"[ERR] disable_features_and_clear_topics: {e}")
+
+    print("[INFO] Finished removing repo objects. Next step: delete repository.")
+    confirm = input(f"Type DELETE to permanently delete the repository {owner}/{repo}: ").strip()
+    if confirm == "DELETE":
+        try:
+            delete_repo(owner, repo, token)
+        except Exception as e:
+            print(f"[ERR] delete_repo: {e}")
+    else:
+        print("[ABORT] Deletion cancelled by user input. No deletion performed.")
+
+if __name__ == "__main__":
+    main(sys.argv)
 name: Auto Close Open Source Dependency Updates
 
 # **What it does**:
